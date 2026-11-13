@@ -1,0 +1,103 @@
+name: release
+
+# Weekly (Mondays), and on demand: fetch the dataset from Wikidata, build wikidata-titles.bin.gz and the
+# wikidata-names-<script>.bin.gz files and publish them as a release, unless the latest release has the same bytes
+# (the build is deterministic, so same data, same files).
+# Keeps the 8 newest releases: clients only ever download the latest.
+on:
+  schedule:
+    - cron: "41 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+# bash with pipefail: `build.py --dump | tee` fails the step when the build does.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      WIKIDATA_USER_AGENT: wikidata-titles/1 (+https://github.com/${{ github.repository }}; GitHub Actions)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Fetch from Wikidata
+        run: |
+          python3 --version
+          python3 build.py --fetch upstream
+          ls -l upstream
+          # Which Wikidata dump the endpoint's index was built from, for the release notes.
+          curl -sSf --retry 3 -A "$WIKIDATA_USER_AGENT" "https://qlever.dev/api/wikidata?cmd=stats" \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin).get("name-index", ""))' > upstream/index.txt || true
+
+      - name: Build and check
+        run: |
+          mkdir -p out
+          python3 build.py upstream out --check
+          for f in out/wikidata-titles.bin.gz out/wikidata-names-*.bin.gz; do python3 build.py --dump "$f"; done | tee out/tables.txt
+          (cd out && sha256sum wikidata-titles.bin.gz wikidata-names-*.bin.gz > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Compare with the latest release
+        id: compare
+        run: |
+          latest=$(gh release download --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --output - 2>/dev/null || true)
+          if [[ "$latest" == "$(cat out/SHA256SUMS)" ]]; then
+            echo "The latest release has the same file: nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Write the release notes
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          sizes=$(for f in out/wikidata-titles.bin.gz out/wikidata-names-*.bin.gz; do
+            echo "- \`$(basename "$f")\`: $(stat -c %s "$f") bytes, $(gzip -dc "$f" | wc -c) bytes unpacked"
+          done)
+          {
+            echo "Fetched $(date -u +%Y-%m-%dT%H:%MZ) from the Wikidata SPARQL endpoint of QLever (https://qlever.dev/wikidata)."
+            if [[ -s upstream/index.txt ]]; then echo; echo "Its index: $(cat upstream/index.txt)."; fi
+            echo
+            echo "Built with this repository's build.py blob $(git hash-object build.py) (commit $GITHUB_SHA)."
+            echo
+            echo "$sizes"
+            echo
+            echo '```'
+            cat out/tables.txt
+            echo '```'
+            echo
+            echo "Contains data from Wikidata (https://www.wikidata.org/), available under CC0 1.0; see the README."
+          } > out/notes.md
+          cat out/notes.md
+
+      - name: Publish the release
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          base="v$(date -u +%Y.%m.%d)"
+          tag=$base
+          n=2
+          while git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; do
+            tag="$base.$n"
+            n=$((n + 1))
+          done
+          gh release create "$tag" out/wikidata-titles.bin.gz out/wikidata-names-*.bin.gz out/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$tag" --notes-file out/notes.md
+
+      - name: Prune old releases
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --exclude-drafts --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[8:] | .[].tagName' |
+            while read -r tag; do
+              echo "Deleting $tag"
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+            done
