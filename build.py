@@ -14,6 +14,7 @@ Usage:
 Python 3.9 or newer, plus trave (pip install -r requirements.txt).
 """
 import argparse
+import gzip
 import hashlib
 import os
 import re
