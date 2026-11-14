@@ -1,5 +1,5 @@
 """Build the wikidata-titles release files: the names, IDs, years, sizes and relations of every Wikidata item with a
-TMDB, AniDB, MyAnimeList or AniList ID, as packed lists (the README's "The format"): the core,
+TMDB, AniDB, MyAnimeList or AniList ID, as Trave files (https://github.com/edde746/trave, magic WDTT): the core,
 wikidata-titles.bin.gz (items and their English, Japanese and "mul" names and titles), and one
 wikidata-names-<script>.bin.gz per script with the labels and aliases in every other language.
 
@@ -11,12 +11,10 @@ Usage:
   python build.py UPSTREAM_DIR OUT_DIR [--check]   build the files (gzip) into OUT_DIR, and with --check read every
                                                    one back and compare it row by row with UPSTREAM_DIR
   python build.py --dump FILE                      print FILE's tables and columns with their sizes
-Python 3.9 or newer, standard library only.
+Python 3.9 or newer, plus trave (pip install -r requirements.txt).
 """
 import argparse
-import gzip
 import hashlib
-import io
 import os
 import re
 import sys
@@ -27,11 +25,9 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-MAGIC, VERSION = b"WDTT", 1
+import trave
 
-# Column types (one byte each in the file), as anime-mappings' packed list.
-INT, INT_DELTA, STR, DICT, INT_LIST, STR_LIST = 1, 2, 3, 4, 5, 6
-TYPE_NAMES = {INT: "int", INT_DELTA: "int_delta", STR: "str", DICT: "dict", INT_LIST: "int_list", STR_LIST: "str_list"}
+MAGIC = b"WDTT"
 
 ENDPOINT = os.environ.get("WIKIDATA_SPARQL", "https://qlever.dev/api/wikidata")
 # Wikimedia's User-Agent policy: name the tool and a way to reach its operator.
@@ -353,82 +349,6 @@ def name_order(n):
     return (q, SOURCES.index(source), lang, text)
 
 
-# --- writing ---------------------------------------------------------------------------------------------------------
-
-def varint(n, out):
-    if n < 0:
-        raise ValueError(f"varint of a negative number {n}")
-    while n > 0x7F:
-        out.append(n & 0x7F | 0x80)
-        n >>= 7
-    out.append(n)
-
-
-def zigzag(n):
-    return n * 2 if n >= 0 else -n * 2 - 1
-
-
-def text(s, out):
-    b = s.encode("utf-8")
-    varint(len(b), out)
-    out += b
-
-
-def column(kind, values):
-    """The column's bytes: one entry per row, `None` for an absent value."""
-    out = bytearray()
-    if kind == DICT:
-        words = list(dict.fromkeys(v for v in values if v is not None))
-        varint(len(words), out)
-        for w in words:
-            text(w, out)
-        index = {w: i for i, w in enumerate(words)}
-    previous = 0
-    for v in values:
-        if v is None:
-            out.append(0)
-        elif kind == INT:
-            varint(zigzag(v) + 1, out)
-        elif kind == INT_DELTA:
-            varint(zigzag(v - previous) + 1, out)
-            previous = v
-        elif kind == STR:
-            b = v.encode("utf-8")
-            varint(len(b) + 1, out)
-            out += b
-        elif kind == DICT:
-            varint(index[v] + 1, out)
-        elif kind == INT_LIST:
-            varint(len(v) + 1, out)
-            for x in v:
-                varint(zigzag(x), out)
-        elif kind == STR_LIST:
-            varint(len(v) + 1, out)
-            for x in v:
-                text(x, out)
-    return out
-
-
-def write_tables(tables):
-    """tables: [(name, rows, [(column name, type, values)])] -> the packed list's bytes (not gzipped)."""
-    out = bytearray(MAGIC)
-    out.append(VERSION)
-    varint(len(tables), out)
-    for name, nrows, columns in tables:
-        text(name, out)
-        varint(nrows, out)
-        varint(len(columns), out)
-        for cname, kind, values in columns:
-            if len(values) != nrows:
-                raise ValueError(f"{name}.{cname}: {len(values)} values for {nrows} rows")
-            body = column(kind, values)
-            text(cname, out)
-            out.append(kind)
-            varint(len(body), out)
-            out += body
-    return bytes(out)
-
-
 # The items table's list columns and number columns, in the file's order.
 ITEM_LISTS = ("tmdb_movie", "tmdb_tv", "anidb", "mal", "anilist", "p31", "p179")
 ITEM_INTS = ("published", "start")
@@ -444,19 +364,19 @@ def tables(items, names, shards):
     def listed(key):
         return [sorted(items[q][key]) if key in items[q] else None for q in order]
 
-    item_columns = [("qid", INT_DELTA, order)]
-    item_columns += [(key, INT_LIST, listed(key)) for key in ITEM_LISTS]
-    item_columns += [(key, INT, [items[q].get(key) for q in order]) for key in ITEM_INTS]
-    item_columns += [("kind", DICT, [items[q]["kind"] for q in order])]
-    item_columns += [(key, INT, [items[q].get(key) for q in order]) for key in ITEM_FACTS_INTS]
-    item_columns += [(key, INT_LIST, listed(key)) for key in ITEM_FACTS_LISTS]
+    item_columns = [("qid", trave.INT_DELTA, order)]
+    item_columns += [(key, trave.INT_LIST, listed(key)) for key in ITEM_LISTS]
+    item_columns += [(key, trave.INT, [items[q].get(key) for q in order]) for key in ITEM_INTS]
+    item_columns += [("kind", trave.DICT, [items[q]["kind"] for q in order])]
+    item_columns += [(key, trave.INT, [items[q].get(key) for q in order]) for key in ITEM_FACTS_INTS]
+    item_columns += [(key, trave.INT_LIST, listed(key)) for key in ITEM_FACTS_LISTS]
 
     def name_columns(names):
         return [
-            ("item", INT_DELTA, [row[n[0]] for n in names]),
-            ("source", DICT, [n[1] for n in names]),
-            ("lang", DICT, [n[2] or None for n in names]),
-            ("text", STR, [n[3] for n in names]),
+            ("item", trave.INT_DELTA, [row[n[0]] for n in names]),
+            ("source", trave.DICT, [n[1] for n in names]),
+            ("lang", trave.DICT, [n[2] or None for n in names]),
+            ("text", trave.STR, [n[3] for n in names]),
         ]
 
     core = [("items", len(order), item_columns), ("names", len(names), name_columns(names))]
@@ -474,112 +394,16 @@ def script_file(s):
 def build_table(build_id):
     """The `build` table: one row naming the core build (the SHA-256 of the core's items and names tables as packed,
     before this table is added), in every file, so that a client can tell that a script file goes with its core."""
-    return ("build", 1, [("id", STR, [build_id])])
+    return ("build", 1, [("id", trave.STR, [build_id])])
 
 
 def build(directory):
-    """The upstream directory as {file name: packed list bytes (not gzipped)}: the core and one file per script."""
+    """The upstream directory as {file name: Trave bytes (not gzipped)}: the core and one file per script."""
     core, scripts = tables(*upstream(directory))
-    build_id = hashlib.sha256(write_tables(core)).hexdigest()
-    out = {CORE_FILE: write_tables([build_table(build_id)] + core)}
+    build_id = hashlib.sha256(trave.pack(MAGIC, core)).hexdigest()
+    out = {CORE_FILE: trave.pack(MAGIC, [build_table(build_id)] + core)}
     for s in SCRIPTS:
-        out[script_file(s)] = write_tables([build_table(build_id)] + scripts[s])
-    return out
-
-
-def gzip_bytes(data):
-    """gzip -9 with no file name and no time, so the same data gives the same bytes."""
-    buffer = io.BytesIO()
-    with gzip.GzipFile(filename="", mode="wb", compresslevel=9, fileobj=buffer, mtime=0) as f:
-        f.write(data)
-    return buffer.getvalue()
-
-
-# --- reading: the reference reader -----------------------------------------------------------------------------------
-
-class Reader:
-    def __init__(self, data, pos=0, end=None):
-        self.data, self.pos, self.end = data, pos, len(data) if end is None else end
-
-    def byte(self):
-        if self.pos >= self.end:
-            raise ValueError("the packed list is cut short")
-        self.pos += 1
-        return self.data[self.pos - 1]
-
-    def varint(self):
-        n = shift = 0
-        while True:
-            b = self.byte()
-            n |= (b & 0x7F) << shift
-            shift += 7
-            if b < 0x80:
-                return n
-
-    def bytes(self, n):
-        if self.pos + n > self.end:
-            raise ValueError("the packed list is cut short")
-        self.pos += n
-        return self.data[self.pos - n:self.pos]
-
-    def text(self):
-        return self.bytes(self.varint()).decode("utf-8")
-
-    def signed(self):
-        return unzigzag(self.varint())
-
-
-def unzigzag(n):
-    return n >> 1 if n % 2 == 0 else -(n >> 1) - 1
-
-
-def read_column(kind, nrows, r):
-    """A column's values, `None` for absent; `r` reads exactly the column's bytes."""
-    words = [r.text() for _ in range(r.varint())] if kind == DICT else None
-    values, previous = [], 0
-    for _ in range(nrows):
-        tag = r.varint()
-        if tag == 0:
-            values.append(None)
-            continue
-        if kind == INT:
-            values.append(unzigzag(tag - 1))
-        elif kind == INT_DELTA:
-            previous += unzigzag(tag - 1)
-            values.append(previous)
-        elif kind == STR:
-            values.append(r.bytes(tag - 1).decode("utf-8"))
-        elif kind == DICT:
-            values.append(words[tag - 1])
-        elif kind == INT_LIST:
-            values.append([r.signed() for _ in range(tag - 1)])
-        elif kind == STR_LIST:
-            values.append([r.text() for _ in range(tag - 1)])
-    if r.pos != r.end:
-        raise ValueError(f"{r.end - r.pos} bytes left in a column")
-    return values
-
-
-def read(data):
-    """The packed list (gzipped or not) as {table: (rows, {column: values})}; columns of an unknown type are skipped."""
-    if data[:2] == b"\x1f\x8b":
-        data = gzip.decompress(data)
-    r = Reader(data)
-    if r.bytes(4) != MAGIC or r.byte() != VERSION:
-        raise ValueError(f"not a version {VERSION} wikidata-titles packed list")
-    out = {}
-    for _ in range(r.varint()):
-        name, nrows = r.text(), r.varint()
-        columns = {}
-        for _ in range(r.varint()):
-            cname, kind, length = r.text(), r.byte(), r.varint()
-            body = Reader(data, r.pos, r.pos + length)
-            r.bytes(length)
-            if kind in TYPE_NAMES:
-                columns[cname] = read_column(kind, nrows, body)
-        out[name] = (nrows, columns)
-    if r.pos != len(data):
-        raise ValueError(f"{len(data) - r.pos} bytes after the last table")
+        out[script_file(s)] = trave.pack(MAGIC, [build_table(build_id)] + scripts[s])
     return out
 
 
@@ -625,12 +449,12 @@ def dataset(core_read, scripts_read):
 def check(out, directory):
     """Reads every file in OUT back and compares it with UPSTREAM_DIR, and checks that the build ids agree (they
     are the SHA-256 of the core's items and names, recomputed here)."""
-    core_read = read((out / CORE_FILE).read_bytes())
-    scripts_read = {s: read((out / script_file(s)).read_bytes()) for s in SCRIPTS}
+    core_read = trave.read((out / CORE_FILE).read_bytes(), MAGIC)
+    scripts_read = {s: trave.read((out / script_file(s)).read_bytes(), MAGIC) for s in SCRIPTS}
     actual_items, actual_names, actual_shards = dataset(core_read, scripts_read)
     items, names, shards = upstream(directory)
     core, _ = tables(items, names, shards)
-    if build_id(core_read, CORE_FILE) != hashlib.sha256(write_tables(core)).hexdigest():
+    if build_id(core_read, CORE_FILE) != hashlib.sha256(trave.pack(MAGIC, core)).hexdigest():
         raise SystemExit("check: the core's build id is not the SHA-256 of its items and names")
     if actual_items != items:
         for q in items:
@@ -651,9 +475,10 @@ def check(out, directory):
 
 def dump(path):
     data = Path(path).read_bytes()
-    raw = gzip.decompress(data)
+    raw = trave.unpack(data)
+    trave.read(raw, MAGIC)  # the whole file is valid before anything is printed
     print(f"{path}: {len(data):,} bytes, {len(raw):,} unpacked")
-    r = Reader(raw, 5)
+    r = trave.Reader(raw, 5)
     for _ in range(r.varint()):
         name, nrows = r.text(), r.varint()
         print(f"{name}: {nrows:,} rows")
@@ -661,9 +486,9 @@ def dump(path):
             cname, kind, length = r.text(), r.byte(), r.varint()
             value = r.bytes(length)
             shown = ""
-            if name == "build" and kind == STR:
-                shown = "  " + read_column(STR, nrows, Reader(value))[0][:12]
-            print(f"  {cname:12} {TYPE_NAMES.get(kind, kind):10} {length:>11,} bytes{shown}")
+            if name == "build" and kind == trave.STR:
+                shown = "  " + trave.read_column(trave.STR, nrows, trave.Reader(value))[0][:12]
+            print(f"  {cname:12} {trave.TYPE_NAMES.get(kind, kind):10} {length:>11,} bytes{shown}")
 
 
 def main():
@@ -671,7 +496,7 @@ def main():
     p.add_argument("inputs", nargs="*", type=Path)
     p.add_argument("--fetch", type=Path, metavar="UPSTREAM_DIR", help="fetch the upstream files into UPSTREAM_DIR")
     p.add_argument("--check", action="store_true", help="read OUT_DIR's files back and compare them with UPSTREAM_DIR")
-    p.add_argument("--dump", type=Path, help="print a packed list's tables and columns")
+    p.add_argument("--dump", type=Path, help="print a Trave file's tables and columns")
     a = p.parse_args()
     if a.fetch:
         fetch(a.fetch)
@@ -688,7 +513,7 @@ def main():
         raise SystemExit(f"unknown upstream data, not built: {e}")
     out.mkdir(parents=True, exist_ok=True)
     for name, data in files.items():
-        packed = gzip_bytes(data)
+        packed = trave.gzip_bytes(data)
         tmp = out / (name + ".part")
         tmp.write_bytes(packed)
         os.replace(tmp, out / name)

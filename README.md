@@ -17,11 +17,11 @@ every week:
 - their labels and aliases in every other language, one optional file per script (Latin, Cyrillic, CJK, Arabic and
   other; about 1,240,000 names), for apps that match names in those languages.
 
-The files hold them, as Wikidata has them, as [packed lists](#the-format): tables of named, typed columns that an
-app reads with nothing but a gzip decoder. `wikidata-titles.bin.gz`, the core, has the items and the names above
-(about 10.5 MB; 28 MB unpacked). `wikidata-names-<script>.bin.gz` has one script's other-language names (1.2 to
-8.4 MB each); an app downloads only the scripts it needs. Normalising the names for lookups is up to the app, so it
-can change how it does without a new file.
+The files hold them, as Wikidata has them, as [Trave](https://github.com/edde746/trave) files: tables of named,
+typed columns that an app reads with nothing but a gzip decoder. `wikidata-titles.bin.gz`, the core, has the items
+and the names above (about 10.5 MB; 28 MB unpacked). `wikidata-names-<script>.bin.gz` has one script's
+other-language names (1.2 to 8.4 MB each); an app downloads only the scripts it needs. Normalising the names for
+lookups is up to the app, so it can change how it does without a new file.
 
 It was made for the `wikidata` metadata provider of the kigumi media server, which resolves a folder or file name to
 its TMDB entry when the name is a Wikidata label or alias of exactly one film or series.
@@ -78,58 +78,25 @@ it. The same fetched data always gives the same bytes (`gzip -9`, no file name, 
 ## Building
 
 ```sh
-python3 build.py --fetch upstream                  # the queries' results, one TSV per query (about 3 min)
-python3 build.py upstream out --check              # build every file into out/, read each back and compare
-python3 build.py --dump out/wikidata-titles.bin.gz # a file's tables and columns, with their sizes
+python build.py --fetch upstream                  # the queries' results, one TSV per query (about 3 min)
+python build.py upstream out --check              # build every file into out/, read each back and compare
+python build.py --dump out/wikidata-titles.bin.gz # a file's tables and columns, with their sizes
 ```
 
-Python 3.9 or newer, standard library only. `--fetch` sends a descriptive User-Agent (set `WIKIDATA_USER_AGENT` to
-yours), pages each query (`LIMIT`/`OFFSET` after a `COUNT`, since QLever's public instance stops a query after
-30 s), and retries pages the endpoint cuts short. `WIKIDATA_SPARQL` points it at another endpoint.
+Python 3.9 or newer, plus `trave` (`pip install -r requirements.txt`). `--fetch` sends a descriptive User-Agent (set
+`WIKIDATA_USER_AGENT` to yours), pages each query (`LIMIT`/`OFFSET` after a `COUNT`, since QLever's public instance
+stops a query after 30 s), and retries pages the endpoint cuts short. `WIKIDATA_SPARQL` points it at another
+endpoint.
 
-`build.py` also has the reference reader: `read(bytes)` returns a file's tables and columns, `dataset(core, scripts)`
-turns the core's and the script files' tables back into the items and names `--check` compares (and refuses a
-script file of another build).
+`dataset(core, scripts)` in `build.py` turns the core's and the script files' tables, as `trave.read` returns them,
+back into the items and names `--check` compares (and refuses a script file of another build).
 
 ## The format
 
-Each file is one gzip member. Unpacked, it is:
-
-| Bytes | Contents |
-|---|---|
-| 4 | `WDTT` |
-| 1 | the format version, `1` |
-| varint | the number of tables, then each table: |
-| string | its name |
-| varint | its number of rows |
-| varint | its number of columns, then each column: |
-| string | its name |
-| 1 | its type (below) |
-| varint | the length of its data in bytes |
-| that many bytes | its data: one value per row, in row order |
-
-Nothing follows the last table.
-
-- A **varint** is an unsigned LEB128 number: 7 bits per byte, low bits first, the high bit set on every byte but the
-  last. A **signed** number is zigzag-coded into one: 0, -1, 1, -2, 2 ... become 0, 1, 2, 3, 4 ... (`n * 2` for
-  `n >= 0`, `-n * 2 - 1` for `n < 0`). Every number fits in a signed 64-bit integer.
-- A **string** is a varint byte length, then that many bytes of UTF-8.
-- Every value can be **absent**. Each value starts with a varint tag: `0` is absent; any other tag `t` says what
-  follows, by the column's type:
-
-| Type | Name | A present value |
-|---|---|---|
-| 1 | `int` | `t - 1` is the number, signed (zigzag) |
-| 2 | `int_delta` | `t - 1` is the number's difference from the column's previous present value (0 before the first), signed |
-| 3 | `str` | `t - 1` bytes of UTF-8 follow |
-| 4 | `dict` | the column's data starts with a varint count and that many strings, the dictionary, before the first row; the value is the dictionary's string number `t - 1` (from 0) |
-| 5 | `int_list` | `t - 1` items follow, each a signed varint |
-| 6 | `str_list` | `t - 1` items follow, each a string |
-
-This is the format of [anime-mappings](https://github.com/edde746/anime-mappings) with another magic. A reader finds
-tables and columns by name and skips by its length any column it doesn't need or whose type it doesn't know; new
-columns and tables may appear in later files of the same version, and their order may change. A column's data ends
-exactly at its length. A new version number means a change an old reader can't skip.
+Each file is a [Trave](https://github.com/edde746/trave#readme) file with the magic `WDTT`. Apps read it with any
+Trave library (Python `trave`, Go `github.com/edde746/trave/go`, Kotlin `dev.edde746:trave`, Dart `trave`) or with
+nothing but a gzip decoder by following the spec. A reader finds tables and columns by name and skips any it doesn't
+need; new columns and tables may appear in later files, and their order may change.
 
 The core, `wikidata-titles.bin.gz`, holds the tables `build`, `items` and `names`; each
 `wikidata-names-<script>.bin.gz` holds `build` and its `names_<script>` table.
@@ -140,7 +107,7 @@ One row, in every file.
 
 | Column | Type | Contents |
 |---|---|---|
-| `id` | str | the build's id: the SHA-256 (64 hex digits) of the packed list (unpacked) holding just the core's `items` and `names` tables, in that order (magic, version, 2 tables) |
+| `id` | str | the build's id: the SHA-256 (64 hex digits) of the Trave file (unpacked) holding just the core's `items` and `names` tables, in that order (magic, version, 2 tables) |
 
 A script file goes with the core whose `build.id` is its own: its `item` column points at that core's rows. A reader
 that loads a script file of another build (say, a core and a script file from different releases) must not use it.
