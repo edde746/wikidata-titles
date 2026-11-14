@@ -1,0 +1,2 @@
+# The Trave reader and writer (https://github.com/edde746/trave), pinned so that builds are reproducible.
+trave==1.0.0

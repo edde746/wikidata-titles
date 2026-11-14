@@ -31,20 +31,27 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the dependencies
+        run: python -m pip install -r requirements.txt
+
       - name: Fetch from Wikidata
         run: |
-          python3 --version
-          python3 build.py --fetch upstream
+          python --version
+          python build.py --fetch upstream
           ls -l upstream
           # Which Wikidata dump the endpoint's index was built from, for the release notes.
           curl -sSf --retry 3 -A "$WIKIDATA_USER_AGENT" "https://qlever.dev/api/wikidata?cmd=stats" \
-            | python3 -c 'import json, sys; print(json.load(sys.stdin).get("name-index", ""))' > upstream/index.txt || true
+            | python -c 'import json, sys; print(json.load(sys.stdin).get("name-index", ""))' > upstream/index.txt || true
 
       - name: Build and check
         run: |
           mkdir -p out
-          python3 build.py upstream out --check
-          for f in out/wikidata-titles.bin.gz out/wikidata-names-*.bin.gz; do python3 build.py --dump "$f"; done | tee out/tables.txt
+          python build.py upstream out --check
+          for f in out/wikidata-titles.bin.gz out/wikidata-names-*.bin.gz; do python build.py --dump "$f"; done | tee out/tables.txt
           (cd out && sha256sum wikidata-titles.bin.gz wikidata-names-*.bin.gz > SHA256SUMS && cat SHA256SUMS)
 
       - name: Compare with the latest release
@@ -68,7 +75,7 @@ jobs:
             echo "Fetched $(date -u +%Y-%m-%dT%H:%MZ) from the Wikidata SPARQL endpoint of QLever (https://qlever.dev/wikidata)."
             if [[ -s upstream/index.txt ]]; then echo; echo "Its index: $(cat upstream/index.txt)."; fi
             echo
-            echo "Built with this repository's build.py blob $(git hash-object build.py) (commit $GITHUB_SHA)."
+            echo "Built with this repository's build.py blob $(git hash-object build.py) and requirements.txt blob $(git hash-object requirements.txt) (commit $GITHUB_SHA)."
             echo
             echo "$sizes"
             echo
